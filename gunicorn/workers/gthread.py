@@ -126,11 +126,15 @@ class ThreadWorker(base.Worker):
             # wait until socket is readable
             with self._lock:
                 self.poller.register(conn.sock, selectors.EVENT_READ,
-                                     partial(self.on_client_socket_readable, conn))
+                                     ('readable', partial(self.on_client_socket_readable, conn)))
+            return True
         except OSError as e:
-            if e.errno not in (errno.EAGAIN, errno.ECONNABORTED,
-                               errno.EWOULDBLOCK):
-                raise
+            if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return True
+            elif e.errno == errno.ECONNABORTED:
+                return False
+
+            raise
 
     def on_client_socket_readable(self, conn, client):
         with self._lock:
@@ -198,9 +202,9 @@ class ThreadWorker(base.Worker):
             # name unavailable in the request handler so capture it once here
             server = sock.getsockname()
             acceptor = partial(self.accept, server)
-            self.poller.register(sock, selectors.EVENT_READ, acceptor)
+            self.poller.register(sock, selectors.EVENT_READ, ('accept', acceptor))
 
-        while self.alive:
+        while True:
             # notify the arbiter we are alive
             self.notify()
 
@@ -209,8 +213,14 @@ class ThreadWorker(base.Worker):
                 # wait for an event
                 events = self.poller.select(1.0)
                 for key, _ in events:
-                    callback = key.data
-                    callback(key.fileobj)
+                    callback_type, callback = key.data
+                    if callback_type == 'accept':
+                        accepted = callback(key.fileobj)
+                        if not self.alive and not accepted:
+                            for sock in self.sockets:
+                                self.poller.unregister(sock)
+                    else:
+                        callback(key.fileobj)
 
                 # check (but do not wait) for finished requests
                 result = futures.wait(self.futures, timeout=0,
@@ -229,6 +239,9 @@ class ThreadWorker(base.Worker):
 
             # handle keepalive timeouts
             self.murder_keepalived()
+
+            if self.nr_conns == 0 and not self.alive:
+                break
 
         self.tpool.shutdown(False)
         self.poller.close()
@@ -259,7 +272,7 @@ class ThreadWorker(base.Worker):
 
                     # add the socket to the event loop
                     self.poller.register(conn.sock, selectors.EVENT_READ,
-                                         partial(self.on_client_socket_readable, conn))
+                                         ('readable', partial(self.on_client_socket_readable, conn)))
             else:
                 self.nr_conns -= 1
                 conn.close()
